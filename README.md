@@ -1,4 +1,4 @@
-# Steps to resproduce error
+# Steps to reproduce error
 
 root@3297547ee6e0:/home/tensorrt-test# python3 create_trt.py
 
