@@ -37,11 +37,32 @@ message(STATUS "Targeting Edge Platform: ${EFL_PLATFORM_ID}")
 
 add_executable(${PROJECT_NAME}
     inference.cpp
+    trt_utils.cpp
 )
 
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
 target_compile_definitions(${PROJECT_NAME} PRIVATE JSON_DIAGNOSTICS=1)
 target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS})
+
+
+# Edge SDK
+include_directories( /opt/edge_sdk/include )
+link_directories( /opt/edge_sdk/lib )
+target_link_libraries(${PROJECT_NAME} PRIVATE /opt/edge_sdk/lib/libedge_sdk.so.2)
+
+
+# JSON
+include(FetchContent)
+FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
+FetchContent_MakeAvailable(json)
+target_link_libraries(${PROJECT_NAME} PRIVATE nlohmann_json::nlohmann_json)
+
+
+# Google LOG
+find_package(glog 0.7.0 REQUIRED)
+include_directories(${glog_INCLUDE_DIRS})
+link_directories(${glog_LIBRARY_DIRS})
+target_link_libraries(${PROJECT_NAME} PRIVATE glog::glog)
 
 
 # OpenCV

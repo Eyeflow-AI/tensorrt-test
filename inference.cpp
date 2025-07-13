@@ -1,88 +1,25 @@
-#include <iostream>
+// #include <iostream>
 #include <string>
 #include <vector>
-#include <cmath>
+// #include <cmath>
 #include <fstream>
 #include <filesystem>
 namespace fs = std::filesystem;
+
+#include <glog/logging.h>
 
 #include <opencv2/opencv.hpp>
 
 #include "NvInferPlugin.h"
 #include "NvInferRuntimeCommon.h"
+#include "trt_utils.h"
 // --------------------------------------------------------------------------------------------------------------------------------
-
-#define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
-void check(cudaError_t err, const char* const func, const char* const file,
-           const int line)
-{
-    if (err != cudaSuccess)
-    {
-        std::cerr << "CUDA Runtime Error at: " << file << ":" << line
-                  << std::endl;
-        std::cerr << cudaGetErrorString(err) << " " << func << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-}
-// --------------------------------------------------------------------------------------------------------------------------------
-
-#define CHECK_LAST_CUDA_ERROR() check_last(__FILE__, __LINE__)
-void check_last(const char* const file, const int line)
-{
-    cudaError_t const err{cudaGetLastError()};
-    if (err != cudaSuccess)
-    {
-        std::cerr << "CUDA Runtime Error at: " << file << ":" << line
-                  << std::endl;
-        std::cerr << cudaGetErrorString(err) << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-}
-// --------------------------------------------------------------------------------------------------------------------------------
-
-class CustomLogger : public nvinfer1::ILogger
-{
-    void log(nvinfer1::ILogger::Severity severity,
-             const char* msg) noexcept override
-    {
-        // suppress info-level messages
-        if (severity <= nvinfer1::ILogger::Severity::kINFO)
-        {
-            std::cout << msg << std::endl;
-        }
-    }
-};
-// --------------------------------------------------------------------------------------------------------------------------------
-
-struct InferDeleter
-{
-    template <typename T>
-    void operator()(T* obj) const
-    {
-        delete obj;
-    }
-};
-// --------------------------------------------------------------------------------------------------------------------------------
-
-inline std::ostream& operator<<(std::ostream& os, const nvinfer1::Dims& dims)
-{
-    os << "(";
-    for (int i = 0; i < dims.nbDims; ++i)
-    {
-        os << (i ? ", " : "") << dims.d[i];
-    }
-    return os << ")";
-}
-// --------------------------------------------------------------------------------------------------------------------------------
-
 
 int main(int argc, char* argv[])
 {
-    std::cout << "Load model";
-
     if (argc != 3)
     {
-        std::cerr << "Usage: " << argv[0]
+        LOG(ERROR) << "Usage: " << argv[0]
                   << "<engine_file_path> <image_file_path>" << std::endl;
         return EXIT_FAILURE;
     }
@@ -90,17 +27,11 @@ int main(int argc, char* argv[])
     std::string const engine_file_path{argv[1]};
     std::string const image_file_path{argv[2]};
 
-    std::cout << "Engine file path: " << engine_file_path << std::endl;
+    LOG(INFO) << "Engine file path: " << engine_file_path << std::endl;
 
-    int m_input_channels = 3;
-    int patch_size = 320;
-    int max_input_size = 5000;
-    int max_side_size = 1920;
-
-	std::vector<nvinfer1::Dims> m_input_dims;  //!< The dimensions of the input to the network.
-	std::vector<nvinfer1::Dims> m_output_dims; //!< The dimensions of the output to the network.
-	std::vector<std::string> m_input_tensor_names;
-	std::vector<std::string> m_output_tensor_names;
+    int patch_size = 160;
+    // int max_image_side = 1600;
+    int max_input_side = 2000;
 
     CustomLogger logger{};
 
@@ -111,14 +42,20 @@ int main(int argc, char* argv[])
     std::unique_ptr<nvinfer1::IRuntime, InferDeleter> m_runtime{nvinfer1::createInferRuntime(logger)};
     if (m_runtime == nullptr)
     {
-        std::cerr << "Failed to create the runtime." << std::endl;
+        LOG(ERROR) << "Failed to create the runtime." << std::endl;
         return EXIT_FAILURE;
     }
 
+    // Load the plugin library.
+    initLibNvInferPlugins(&logger, "");
+    m_runtime->getPluginRegistry().loadLibrary("./build/libtensorrt_plugin-tile_image.so");
+    m_runtime->getPluginRegistry().loadLibrary("./build/libtensorrt_plugin-adjust_tiled_boxes.so");
+
+    LOG(INFO) << "Loading engine file: " << engine_file_path << std::endl;
     std::ifstream engine_file{engine_file_path, std::ios::binary};
     if (!engine_file)
     {
-        std::cerr << "Failed to open the engine file." << std::endl;
+        LOG(ERROR) << "Failed to open the engine file." << std::endl;
         return EXIT_FAILURE;
     }
 
@@ -134,197 +71,163 @@ int main(int argc, char* argv[])
     if (!m_engine)
     {
         std::string errmsg = "Error creating TRT Engine";
-        std::cerr << errmsg;
+        LOG(ERROR) << errmsg;
         throw std::runtime_error(errmsg);
     }
 
     // Create the execution context.
-    std::unique_ptr<nvinfer1::IExecutionContext, InferDeleter> m_context{m_engine->createExecutionContext()};
+    std::shared_ptr<nvinfer1::IExecutionContext> m_context{m_engine->createExecutionContext()};
     if (m_context == nullptr)
     {
-        std::cerr << "Failed to create the execution context." << std::endl;
+        LOG(ERROR) << "Failed to create the execution context." << std::endl;
         return EXIT_FAILURE;
     }
 
-    nvinfer1::TensorFormat const expected_format{nvinfer1::TensorFormat::kLINEAR};
+    cv::Mat orig_image = cv::imread(image_file_path);
+    cv::Mat input_image;
+    double resize_scale = std::min(static_cast<double>(max_input_side) / orig_image.cols, static_cast<double>(max_input_side) / orig_image.rows);
+    if (resize_scale < 1.0)
+        cv::resize(orig_image, input_image, cv::Size(), resize_scale, resize_scale, cv::INTER_LINEAR);
+    // orig_image(cv::Range(500, 500 + 2 * patch_size), cv::Range(3100, 3100 + 2 * patch_size)).convertTo(input_image, CV_8UC3);
+    // orig_image(cv::Range(500, 500 + 2 * patch_size), cv::Range(1000, 1000 + 2 * patch_size)).convertTo(input_image, CV_8UC3);
+    int m_input_channels = 3;
 
-    // IO tensor information and buffers.
-    std::vector<nvinfer1::Dims> input_tensor_shapes{};
-    std::vector<nvinfer1::Dims> output_tensor_shapes{};
-    std::vector<size_t> input_tensor_sizes{};
-    std::vector<size_t> output_tensor_sizes{};
-    std::vector<char const*> input_tensor_names{};
-    std::vector<char const*> output_tensor_names{};
-    std::vector<void*> input_tensor_host_buffers{};
-    std::vector<void*> input_tensor_device_buffers{};
-    std::vector<void*> output_tensor_host_buffers{};
-    std::vector<void*> output_tensor_device_buffers{};
-
-    // Check the number of IO tensors.
-    int32_t const num_io_tensors{m_engine->getNbIOTensors()};
-    std::cout << "Number of IO Tensors: " << num_io_tensors << std::endl;
-    for (int32_t i{0}; i < num_io_tensors; ++i)
-    {
-        char const* const tensor_name{m_engine->getIOTensorName(i)};
-        std::cout << "Tensor name: " << tensor_name << std::endl;
-        nvinfer1::TensorIOMode const io_mode{m_engine->getTensorIOMode(tensor_name)};
-        nvinfer1::DataType const dtype{m_engine->getTensorDataType(tensor_name)};
-        size_t expected_dtype_byte_size;
-        if (dtype == nvinfer1::DataType::kFLOAT)
-        {
-            expected_dtype_byte_size = 4;
-        }
-        else if (dtype == nvinfer1::DataType::kINT32)
-        {
-            expected_dtype_byte_size = 4;
-        }
-        else if (dtype == nvinfer1::DataType::kINT64)
-        {
-            expected_dtype_byte_size = 8;
-        }
-        else
-        {
-            std::cerr << "Invalid data type." << std::endl;
-            return EXIT_FAILURE;
-        }
-
-        nvinfer1::TensorFormat const format{m_engine->getTensorFormat(tensor_name)};
-        if (format != expected_format)
-        {
-            std::cerr << "Invalid tensor format." << std::endl;
-            return EXIT_FAILURE;
-        }
-        // Because the input and output shapes are static,
-        // there is no need to set the IO tensor shapes.
-        nvinfer1::Dims const shape{m_engine->getTensorShape(tensor_name)};
-        // Print out dims.
-        size_t tensor_size{1U};
-        std::cout << "Tensor Dims: ";
-        for (int32_t j{0}; j < shape.nbDims; ++j)
-        {
-            tensor_size *= shape.d[j];
-            std::cout << shape.d[j] << " ";
-        }
-        std::cout << std::endl;
-
-        if (tensor_name == std::string("input_image"))
-        {
-            tensor_size = m_input_channels * max_input_size * max_input_size;
-        }
-        else if (tensor_name == std::string("paded_image"))
-        {
-            tensor_size = m_input_channels * max_side_size * max_side_size;
-        }
-
-        size_t tensor_size_bytes{tensor_size * expected_dtype_byte_size};
-
-        // Allocate host memory for the tensor.
-        void* tensor_host_buffer{nullptr};
-        CHECK_CUDA_ERROR(cudaMallocHost(&tensor_host_buffer, tensor_size_bytes));
-        // Allocate device memory for the tensor.
-        void* tensor_device_buffer{nullptr};
-        CHECK_CUDA_ERROR(cudaMalloc(&tensor_device_buffer, tensor_size_bytes));
-
-        bool status = m_context->setTensorAddress(tensor_name, tensor_device_buffer);
-
-        if (!status)
-            throw std::runtime_error("Failure in setTensorAddress");
-
-        if (io_mode == nvinfer1::TensorIOMode::kINPUT)
-        {
-            input_tensor_host_buffers.push_back(tensor_host_buffer);
-            input_tensor_device_buffers.push_back(tensor_device_buffer);
-            input_tensor_shapes.push_back(shape);
-            input_tensor_sizes.push_back(tensor_size);
-            input_tensor_names.push_back(tensor_name);
-        }
-        else
-        {
-            output_tensor_host_buffers.push_back(tensor_host_buffer);
-            output_tensor_device_buffers.push_back(tensor_device_buffer);
-            output_tensor_shapes.push_back(shape);
-            output_tensor_sizes.push_back(tensor_size);
-            output_tensor_names.push_back(tensor_name);
-        }
-    }
-
-    cv::Mat input_image = cv::imread(image_file_path);
-
-    int input_width = input_image.cols;
-    int input_height = input_image.rows;
-
-    auto cv_depth_size = CV_32FC3;
+    auto cv_input_depth_size = CV_8UC3;
     if (m_input_channels == 1)
     {
         cv::cvtColor(input_image, input_image, cv::COLOR_RGB2GRAY);
-        cv_depth_size = CV_32FC1;
+        cv_input_depth_size = CV_8UC1;
     }
 
-    cv::Mat dest_image(cv::Size(input_image.cols, input_image.rows), cv_depth_size, (void*)(static_cast<float*>(input_tensor_host_buffers.at(0))));
-    input_image.convertTo(dest_image, cv_depth_size);
 
-    // Copy input data from host to device.
-    size_t image_dtype_byte_size = 4;
-    size_t const input_tensor_size_bytes{input_image.cols* input_image.rows * m_input_channels * image_dtype_byte_size};
-    CHECK_CUDA_ERROR(cudaMemcpyAsync(input_tensor_device_buffers.at(0), input_tensor_host_buffers.at(0), input_tensor_size_bytes, cudaMemcpyHostToDevice, stream));
+    int num_classes = 1;
+    std::map<std::string, std::vector<uint>> max_dims{
+        {"input", {1, (uint)max_input_side, (uint)max_input_side, 1}},
+        {"input_image_size", {4}},
+        // {"output_tiles", {56, (uint)patch_size, (uint)patch_size, 1}},
+        // {"output_boxes", {1, 1904000, 4}},
+        // {"output_classification", {1, 1904000, (uint)num_classes}},
+        // {"decode_boxes_1", {56, 34000, (uint)num_classes}},
+    };
+    auto m_buffers = std::make_unique<BufferManager>(m_engine, max_dims, m_context);
 
-    char const* const input_image_tensor_name{input_tensor_names.at(0)};
+    uint32_t* img_size_buffer = static_cast<uint32_t*>(m_buffers->get_host_buffer("input_image_size"));
+    img_size_buffer[0] = 1; // batch size
+    img_size_buffer[1] = input_image.rows; // height
+    img_size_buffer[2] = input_image.cols; // width
+    img_size_buffer[3] = m_input_channels; // channels
+    size_t input_img_size_dtype_byte_size = sizeof(uint32_t);
+    size_t const input_img_size_tensor_size_bytes{4 * input_img_size_dtype_byte_size};
+    std::string input_img_size_tensor_name{"input_image_size"};
+    m_buffers->copy_input_to_device_async(input_img_size_tensor_name, input_img_size_tensor_size_bytes, stream);
+    m_buffers->set_input_shape(input_img_size_tensor_name, std::vector<int>({4}));
 
-    nvinfer1::Dims input_shape{m_engine->getTensorShape(input_image_tensor_name)};
-    input_shape.d[1] = input_image.rows;
-    input_shape.d[2] = input_image.cols;
-    input_shape.d[3] = m_input_channels;
-    m_context->setInputShape(input_image_tensor_name, input_shape);
+    int m_output_channels = 1;
+    auto cv_output_depth_size = CV_32FC3;
+    if (m_output_channels == 1)
+    {
+        cv_output_depth_size = CV_32FC1;
+    }
 
-    uint64_t pad_width = (std::ceil((double)input_width / patch_size) * patch_size) - input_width;
-    uint64_t pad_height = (std::ceil((double)input_height / patch_size) * patch_size) - input_height;
-    std::vector<uint64_t> pad_sizes{0,0,0,0, 0,pad_height,pad_width,0};
+    uint8_t* input_image_buffer = static_cast<uint8_t*>(m_buffers->get_host_buffer("input"));
+    cv::Mat dest_image(cv::Size(input_image.cols, input_image.rows), cv_input_depth_size, (void*)(static_cast<uint8_t*>(input_image_buffer)));
+    input_image.convertTo(dest_image, cv_input_depth_size);
+    cv::imwrite("./build/input_image.jpg", dest_image);
 
-    size_t const pad_tensor_size_bytes{pad_sizes.size() * sizeof(uint64_t)};
-    memcpy(input_tensor_host_buffers.at(1), pad_sizes.data(), pad_tensor_size_bytes);
-    CHECK_CUDA_ERROR(cudaMemcpyAsync(input_tensor_device_buffers.at(1), input_tensor_host_buffers.at(1), pad_tensor_size_bytes, cudaMemcpyHostToDevice, stream));
-    char const* const pad_image_tensor_name{input_tensor_names.at(1)};
-    nvinfer1::Dims pad_shape{m_engine->getTensorShape(pad_image_tensor_name)};
-    m_context->setInputShape(pad_image_tensor_name, pad_shape);
+    size_t input_image_dtype_byte_size = sizeof(uint8_t);
+    size_t const input_tensor_size_bytes{input_image.cols* input_image.rows * m_input_channels * input_image_dtype_byte_size};
+    std::string input_tensor_name{"input"};
+    m_buffers->copy_input_to_device_async(input_tensor_name, input_tensor_size_bytes, stream);
+    m_buffers->set_input_shape(input_tensor_name, std::vector<int>({1, input_image.rows, input_image.cols, m_input_channels}));
 
     // Run inference a couple of times.
     bool const status{m_context->enqueueV3(stream)};
     if (!status)
     {
-        std::cerr << "Failed to run inference." << std::endl;
+        LOG(ERROR) << "Failed to run inference." << std::endl;
         return EXIT_FAILURE;
     }
 
-    // Synchronize.
-    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+    m_buffers->copy_output_to_host_async(stream);
 
-    // Copy output data from device to host.
-    size_t const output_tensor_size_bytes{output_tensor_sizes.at(0) * image_dtype_byte_size};
-    CHECK_CUDA_ERROR(cudaMemcpyAsync(output_tensor_host_buffers.at(0), output_tensor_device_buffers.at(0), output_tensor_size_bytes, cudaMemcpyDeviceToHost, stream));
 
-    cv::Mat output_image(cv::Size(input_width + pad_width, input_height + pad_height), cv_depth_size, (char*)output_tensor_host_buffers.at(0));
-    cv::imwrite("padded_output.jpg", output_image);
+    int m_max_boxes = 30;
+    double m_confidence_thresh = 0.05;
+    auto num_detections = m_buffers->get_mat("num_detections");
+    auto predicted_boxes = m_buffers->get_mat("detection_boxes");
+    auto predicted_scores = m_buffers->get_mat("detection_scores");
+    auto predicted_labels = m_buffers->get_mat("detection_classes");
 
-    std::cout << "Test finished";
+    // auto output_tiles = m_buffers->get_mat("output_tiles");
+    // auto input_image_size = m_buffers->get_mat("input_image_size");
+    // auto output_boxes = m_buffers->get_mat("output_boxes");
+    // auto output_classification = m_buffers->get_mat("decode_boxes_1");
+    // auto output_classification = m_buffers->get_mat("output_classification");
+
+    // float* output_patch_buffer = static_cast<float*>(m_buffers->get_host_buffer("output_tiles"));
+    // size_t output_patch_dtype_byte_size = sizeof(float);
+    // size_t const output_patch_size_bytes{m_output_channels * patch_size * patch_size * output_patch_dtype_byte_size};
+    // for (int patch = 0; patch < 6; ++patch)
+    // {
+    //     cv::Mat output_patch(cv::Size(patch_size, patch_size), cv_output_depth_size, (char*)output_patch_buffer + (patch * output_patch_size_bytes));
+
+    //     auto save_ret = cv::imwrite("./build/tile_image_" + std::to_string(patch) + ".jpg", output_patch);
+    //     if (!save_ret)
+    //         throw std::runtime_error("Fail to save patch");
+    // }
+
+
+    json annotations;
+    std::list<json> instances;
+    std::vector<json> inst_annot;
+    for (int det = 0; det < num_detections.at<int32_t>(0, 0); det++)
+    {
+        if (det > m_max_boxes)
+            break;
+
+            float score = predicted_scores.at<float>(0, det);
+        if (score < m_confidence_thresh)
+            continue;
+
+        int det_class = (int)predicted_labels.at<int32_t>(0, det);
+
+        double x_min = (double)predicted_boxes.at<float>(0, det, 0) / resize_scale;
+        double y_min = (double)predicted_boxes.at<float>(0, det, 1) / resize_scale;
+        double x_max = (double)predicted_boxes.at<float>(0, det, 2) / resize_scale;
+        double y_max = (double)predicted_boxes.at<float>(0, det, 3) / resize_scale;
+        // double x_min = (double)predicted_boxes.at<float>(0, det, 0);
+        // double y_min = (double)predicted_boxes.at<float>(0, det, 1);
+        // double x_max = (double)predicted_boxes.at<float>(0, det, 2);
+        // double y_max = (double)predicted_boxes.at<float>(0, det, 3);
+
+        int width = 1;
+        cv::Scalar color(0, 255, 0);
+        // cv::rectangle(input_image, cv::Rect(x_min, y_min, x_max - x_min, y_max - y_min), color, width);
+        cv::rectangle(orig_image, cv::Rect(x_min, y_min, x_max - x_min, y_max - y_min), color, width);
+
+        instances.push_back({
+            {"class", "furo"},
+            {"label", "furo"},
+            {"bbox", {
+                {"x_min", (int)x_min},
+                {"y_min", (int)y_min},
+                {"x_max", (int)x_max},
+                {"y_max", (int)y_max}
+            }},
+            {"color", "#ffffff"},
+            {"confidence", round(score * 1000) / 1000}
+        });
+    }
+
+    // cv::imwrite("./build/output_image.jpg", input_image);
+    cv::imwrite("./build/output_image.jpg", orig_image);
+
+    // if (instances.size() > 0)
+    //     instances = join_detections(instances);
+
 
     // Release resources.
     CHECK_CUDA_ERROR(cudaStreamDestroy(stream));
-    for (size_t i{0U}; i < input_tensor_host_buffers.size(); ++i)
-    {
-        CHECK_CUDA_ERROR(cudaFreeHost(input_tensor_host_buffers.at(i)));
-    }
-    for (size_t i{0U}; i < input_tensor_device_buffers.size(); ++i)
-    {
-        CHECK_CUDA_ERROR(cudaFree(input_tensor_device_buffers.at(i)));
-    }
-    for (size_t i{0U}; i < output_tensor_host_buffers.size(); ++i)
-    {
-        CHECK_CUDA_ERROR(cudaFreeHost(output_tensor_host_buffers.at(i)));
-    }
-    for (size_t i{0U}; i < output_tensor_device_buffers.size(); ++i)
-    {
-        CHECK_CUDA_ERROR(cudaFree(output_tensor_device_buffers.at(i)));
-    }
 
     return 0;
 }
