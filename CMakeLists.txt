@@ -37,7 +37,10 @@ message(STATUS "Targeting Edge Platform: ${EFL_PLATFORM_ID}")
 
 add_executable(${PROJECT_NAME}
     inference.cpp
+    new_model.cpp
+    old_model.cpp
     trt_utils.cpp
+    trt_utils_old.cpp
 )
 
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)

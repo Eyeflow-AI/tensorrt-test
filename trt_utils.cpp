@@ -8,6 +8,18 @@ namespace fs = std::filesystem;
 #include "trt_utils.h"
 // --------------------------------------------------------------------------------------------------------------------------------
 
+inline std::ostream& operator<<(std::ostream& os, const nvinfer1::Dims& dims)
+{
+    os << "(";
+    for (int i = 0; i < dims.nbDims; ++i)
+    {
+        os << (i ? ", " : "") << dims.d[i];
+    }
+    return os << ")";
+}
+// --------------------------------------------------------------------------------------------------------------------------------
+
+
 //! \brief Create a BufferManager for handling buffer interactions with engine.
 BufferManager::BufferManager(
     std::shared_ptr<nvinfer1::ICudaEngine> engine,

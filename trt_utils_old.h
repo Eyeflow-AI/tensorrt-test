@@ -12,26 +12,27 @@
 using json = nlohmann::json;
 // --------------------------------------------------------------------------------------------------------------------------------
 
-#define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
-void check(cudaError_t err, const char* const func, const char* const file, const int line);
-#define CHECK_LAST_CUDA_ERROR() check_last(__FILE__, __LINE__)
-void check_last(const char* const file, const int line);
-// --------------------------------------------------------------------------------------------------------------------------------
+namespace trt_utils
+{
 
-inline uint32_t get_element_size(nvinfer1::DataType t) noexcept
+inline uint32_t getElementSize(nvinfer1::DataType t) noexcept
 {
     switch (t)
     {
-        case nvinfer1::DataType::kINT64: return 8;
-        case nvinfer1::DataType::kINT32: return 4;
-        case nvinfer1::DataType::kFLOAT: return 4;
-        case nvinfer1::DataType::kHALF: return 2;
-        case nvinfer1::DataType::kBOOL:
-        case nvinfer1::DataType::kUINT8:
-        case nvinfer1::DataType::kINT8: return 1;
+    case nvinfer1::DataType::kINT32: return 4;
+    case nvinfer1::DataType::kFLOAT: return 4;
+    case nvinfer1::DataType::kHALF: return 2;
+    case nvinfer1::DataType::kBOOL:
+    case nvinfer1::DataType::kUINT8:
+    case nvinfer1::DataType::kINT8: return 1;
     }
-
     return 0;
+}
+// --------------------------------------------------------------------------------------------------------------------------------
+
+inline int64_t volume(nvinfer1::Dims const& d)
+{
+    return std::accumulate(&d.d[0], d.d + d.nbDims, int64_t{1}, std::multiplies<int64_t>{});
 }
 // --------------------------------------------------------------------------------------------------------------------------------
 
@@ -62,20 +63,21 @@ class _genericBuffer
 {
 public:
     //! \brief Construct an empty buffer.
-    _genericBuffer(nvinfer1::DataType type = nvinfer1::DataType::kFLOAT):
-        m_size(0),
-        m_capacity(0),
-        m_type(type),
-        m_buffer(nullptr)
-    {};
+    _genericBuffer(nvinfer1::DataType type = nvinfer1::DataType::kFLOAT)
+        : m_size(0)
+        , m_capacity(0)
+        , m_type(type)
+        , m_buffer(nullptr)
+    {
+    };
 
     //! \brief Construct a buffer with the specified allocation size in bytes.
-    _genericBuffer(size_t size, nvinfer1::DataType type):
-        m_size(size),
-        m_capacity(size),
-        m_type(type)
+    _genericBuffer(size_t size, nvinfer1::DataType type)
+        : m_size(size)
+        , m_capacity(size)
+        , m_type(type)
     {
-        if (!m_alloc_fn(&m_buffer, this->nb_bytes()))
+        if (!m_alloc_fn(&m_buffer, this->nbBytes()))
         {
             throw std::bad_alloc();
         }
@@ -86,11 +88,11 @@ public:
         m_free_fn(m_buffer);
     };
 
-    _genericBuffer(_genericBuffer&& buf):
-        m_size(buf.m_size),
-        m_capacity(buf.m_capacity),
-        m_type(buf.m_type),
-        m_buffer(buf.m_buffer)
+    _genericBuffer(_genericBuffer&& buf)
+        : m_size(buf.m_size)
+        , m_capacity(buf.m_capacity)
+        , m_type(buf.m_type)
+        , m_buffer(buf.m_buffer)
     {
         buf.m_size = 0;
         buf.m_capacity = 0;
@@ -112,7 +114,6 @@ public:
             buf.m_capacity = 0;
             buf.m_buffer = nullptr;
         }
-
         return *this;
     };
 
@@ -135,13 +136,33 @@ public:
     };
 
     //! \brief Returns the size (in bytes) of the buffer.
-    size_t nb_bytes() const
+    size_t nbBytes() const
     {
-        return m_size * get_element_size(m_type);
+        return this->size() * getElementSize(m_type);
+    };
+
+    //! \brief Resizes the buffer. This is a no-op if the new size is smaller than or equal to the current capacity.
+    void resize(size_t new_size)
+    {
+        m_size = new_size;
+        if (m_capacity < new_size)
+        {
+            m_free_fn(m_buffer);
+            if (!m_alloc_fn(&m_buffer, this->nbBytes()))
+            {
+                throw std::bad_alloc{};
+            }
+            m_capacity = new_size;
+        }
+    };
+
+    //! \brief Overload of resize that accepts Dims
+    void resize(const nvinfer1::Dims& dims)
+    {
+        return this->resize(volume(dims));
     };
 
 private:
-    nvinfer1::Dims m_tensor_dims;
     size_t m_size{0}, m_capacity{0};
     nvinfer1::DataType m_type;
     void* m_buffer;
@@ -155,8 +176,7 @@ class _deviceAllocator
 public:
     bool operator()(void** ptr, size_t size) const
     {
-        CHECK_CUDA_ERROR(cudaMalloc(ptr, size));
-        return *ptr != nullptr;
+        return cudaMalloc(ptr, size) == cudaSuccess;
     }
 };
 // --------------------------------------------------------------------------------------------------------------------------------
@@ -166,7 +186,7 @@ class _deviceFree
 public:
     void operator()(void* ptr) const
     {
-        CHECK_CUDA_ERROR(cudaFree(ptr));
+        cudaFree(ptr);
     }
 };
 // --------------------------------------------------------------------------------------------------------------------------------
@@ -176,7 +196,7 @@ class _hostAllocator
 public:
     bool operator()(void** ptr, size_t size) const
     {
-        CHECK_CUDA_ERROR(cudaMallocHost(ptr, size));
+        cudaHostAlloc(ptr, size, cudaHostAllocDefault);
         return *ptr != nullptr;
     }
 };
@@ -187,7 +207,7 @@ class _hostFree
 public:
     void operator()(void* ptr) const
     {
-        CHECK_CUDA_ERROR(cudaFreeHost(ptr));
+        cudaFreeHost(ptr);
     }
 };
 // --------------------------------------------------------------------------------------------------------------------------------
@@ -199,11 +219,20 @@ using _hostBuffer = _genericBuffer<_hostAllocator, _hostFree>;
 class _managedBuffer
 {
 public:
-    _deviceBuffer device_buffer;
-    _hostBuffer host_buffer;
+    _deviceBuffer deviceBuffer;
+    _hostBuffer hostBuffer;
 };
 // --------------------------------------------------------------------------------------------------------------------------------
 
+struct InferDeleter
+{
+    template <typename T>
+    void operator()(T* obj) const
+    {
+        delete obj;
+    }
+};
+// --------------------------------------------------------------------------------------------------------------------------------
 
 //! \brief  The BufferManager class handles host and device buffer allocation and deallocation.
 //!
@@ -217,23 +246,37 @@ public:
     //! \brief Create a BufferManager for handling buffer interactions with engine.
     BufferManager(
         std::shared_ptr<nvinfer1::ICudaEngine> engine,
-        std::map<std::string, std::vector<uint>> &max_dims,
-        std::shared_ptr<nvinfer1::IExecutionContext> context
+        const std::vector<uint> batch_size,
+        const nvinfer1::IExecutionContext* context = nullptr
     );
 
     ~BufferManager() = default;
 
+    //! \brief Returns a vector of device buffers that you can use directly as
+    //!        bindings for the execute and enqueue methods of IExecutionContext.
+    std::vector<void*>& getDeviceBindings();
+
+    //! \brief Returns a vector of device buffers.
+    const std::vector<void*>& getDeviceBindings() const;
+
     //! \brief Returns the device buffer corresponding to tensor_name.
     //!        Returns nullptr if no such tensor can be found.
-    void* get_device_buffer(const std::string& tensor_name) const;
+    void* getDeviceBuffer(const std::string& tensor_name) const;
 
     //! \brief Returns the host buffer corresponding to tensor_name.
     //!        Returns nullptr if no such tensor can be found.
-    void* get_host_buffer(const std::string& tensor_name) const;
+    void* getHostBuffer(const std::string& tensor_name) const;
 
     //! \brief Returns the host buffer corresponding to tensor_name.
     //!        Returns nullptr if no such tensor can be found.
-    uint32_t get_buffer_element_size(const std::string& tensor_name) const;
+    uint32_t getBufferElementSize(const std::string& tensor_name) const
+    {
+        auto it_tensor = std::find(m_tensor_names.begin(), m_tensor_names.end(), tensor_name);
+        if (it_tensor == m_tensor_names.end())
+            throw std::runtime_error("Invalid tensor name: " + tensor_name);
+
+        return getElementSize(m_engine->getTensorDataType(tensor_name.c_str()));
+    };
 
     //! \brief Returns the size of the host and device buffers that correspond to tensor_name.
     size_t size(const std::string& tensor_name) const;
@@ -265,60 +308,116 @@ public:
         }
     }
 
-    cv::Mat get_mat(const std::string& tensor_name, uint batch_size=1);
+
+    //! \brief Return an ArrayND instance to access buffer data as array
+    cv::Mat getMat(const std::string& tensor_name, uint batch_size=1)
+    {
+        auto it_tensor = std::find(m_tensor_names.begin(), m_tensor_names.end(), tensor_name);
+        if (it_tensor == m_tensor_names.end())
+            throw std::runtime_error("Invalid tensor name: " + tensor_name);
+
+        nvinfer1::DataType type = m_engine->getTensorDataType(tensor_name.c_str());
+        int cvtype;
+        switch (type)
+        {
+            case nvinfer1::DataType::kINT32:
+                cvtype = CV_32S;
+                break;
+
+            case nvinfer1::DataType::kFLOAT:
+                cvtype = CV_32FC1;
+                break;
+
+            case nvinfer1::DataType::kHALF:
+                cvtype = CV_16FC1;
+                break;
+
+            case nvinfer1::DataType::kBOOL:
+                cvtype = CV_8U;
+                break;
+
+            case nvinfer1::DataType::kUINT8:
+                cvtype = CV_8U;
+                break;
+
+            case nvinfer1::DataType::kINT8:
+                cvtype = CV_8S;
+                break;
+
+            default:
+                throw std::runtime_error("Invalid buffer type: " + std::to_string((int)type) + " for tensor: " + tensor_name);
+        }
+
+        auto dims = m_engine->getTensorShape(tensor_name.c_str());
+        if (dims.d[0] == -1)
+            dims.d[0] = batch_size;
+
+        std::vector<int> dm;
+        for (int d = 0; d < dims.nbDims; d++)
+            dm.push_back(dims.d[d]);
+
+        int index = it_tensor - m_tensor_names.begin();
+        cv::Mat ret_mat(dm, cvtype, m_managed_buffers[index]->hostBuffer.data());
+        return std::move(ret_mat);
+    }
+
 
     //! \brief Copy the contents of input host buffers to input device buffers synchronously.
-    // void copy_input_to_device();
+    void copyInputToDevice();
 
     //! \brief Copy the contents of output device buffers to output host buffers synchronously.
-    // void copy_output_to_host();
+    void copyOutputToHost();
 
     //! \brief Copy the contents of input host buffers to input device buffers asynchronously.
-    void copy_input_to_device_async(const std::string& tensor_name, size_t buf_size, const cudaStream_t& stream);
+    void copyInputToDeviceAsync(const cudaStream_t& stream = 0);
 
     //! \brief Copy the contents of output device buffers to output host buffers asynchronously.
-    void copy_output_to_host_async(const cudaStream_t& stream);
-
-    void set_input_shape(const std::string& tensor_name, const std::vector<int> input_shape);
+    void copyOutputToHostAsync(const cudaStream_t& stream = 0);
 
 private:
-    void* get_buffer(const bool isHost, const std::string& tensor_name) const;
-    // void mem_cpy_buffers(const bool copyInput, const bool deviceToHost, const bool async, const cudaStream_t& stream = 0);
+    void* getBuffer(const bool isHost, const std::string& tensor_name) const;
+
+    void memcpyBuffers(const bool copyInput, const bool deviceToHost, const bool async, const cudaStream_t& stream = 0);
 
     std::shared_ptr<nvinfer1::ICudaEngine> m_engine;
-    std::shared_ptr<nvinfer1::IExecutionContext> m_context;
+    std::vector<uint> m_dims_size;
     std::vector<std::string> m_tensor_names;
     std::vector<std::unique_ptr<_managedBuffer>> m_managed_buffers;
-    std::map<std::string, std::vector<uint>> m_max_dims;
+    std::vector<void*> m_device_bindings;
 }; // class BufferManager
 // --------------------------------------------------------------------------------------------------------------------------------
 
-class CustomLogger : public nvinfer1::ILogger
+
+//! Class which manages logging of TensorRT
+//! - Debugging messages with an associated severity (info, warning, error, or internal error/fatal)
+class Logger : public nvinfer1::ILogger
 {
-    void log(nvinfer1::ILogger::Severity severity, const char* msg) noexcept override
-    {
-        // suppress info-level messages
-        if (severity <= nvinfer1::ILogger::Severity::kINFO)
-        {
-            LOG(INFO) << "[TRT] " << std::string(msg);
-        }
-    }
-};
+public:
+    static Logger *get_instance();
+
+    nvinfer1::ILogger& getTRTLogger() noexcept;
+
+    //! \brief Implementation of the nvinfer1::ILogger::log() virtual method
+    void log(Severity severity, const char* msg) noexcept override;
+
+    //! \brief Method for controlling the verbosity of logging output
+    void setReportableSeverity(Severity severity) noexcept;
+
+    Severity getReportableSeverity() const;
+
+private:
+    explicit Logger();
+
+    Severity mReportableSeverity;
+}; // class Logger
 // --------------------------------------------------------------------------------------------------------------------------------
 
-struct InferDeleter
-{
-    template <typename T>
-    void operator()(T* obj) const
-    {
-        delete obj;
-    }
-};
-// --------------------------------------------------------------------------------------------------------------------------------
 
-// template <typename T>
-// using InferUniquePtr = std::unique_ptr<T, InferDeleter>;
+template <typename T>
+using InferUniquePtr = std::unique_ptr<T, InferDeleter>;
 // --------------------------------------------------------------------------------------------------------------------------------
 
 json get_model_props(std::string dataset_id);
 // --------------------------------------------------------------------------------------------------------------------------------
+
+} // namespace trt_utils
